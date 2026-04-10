@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const Ably = require('ably');
+const mysql = require('mysql2/promise');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,10 +9,68 @@ const ABLY_API_KEY = process.env.ABLY_API_KEY || '';
 const CHAT_ENGINE_API_KEY = process.env.CHAT_ENGINE_API_KEY || '';
 const DEFAULT_CHANNEL = process.env.CHAT_DEFAULT_CHANNEL || 'global-chat';
 const ENABLE_PUBLIC_CHAT_DEMO = (process.env.ENABLE_PUBLIC_CHAT_DEMO || 'true').toLowerCase() === 'true';
+const CHAT_MESSAGES_TABLE = process.env.CHAT_MESSAGES_TABLE || 'chat_messages';
+const CHAT_AUTO_CREATE_TABLE = (process.env.CHAT_AUTO_CREATE_TABLE || 'true').toLowerCase() === 'true';
+
+const DB_HOST = process.env.DB_HOST || '';
+const DB_PORT = Number(process.env.DB_PORT || 3306);
+const DB_DATABASE = process.env.DB_DATABASE || '';
+const DB_USERNAME = process.env.DB_USERNAME || '';
+const DB_PASSWORD = process.env.DB_PASSWORD || '';
 
 app.use(express.json());
 
-const memoryHistory = new Map();
+let dbPool = null;
+
+function hasDbConfig() {
+  return Boolean(DB_HOST && DB_DATABASE && DB_USERNAME);
+}
+
+async function getDbPool() {
+  if (!hasDbConfig()) return null;
+  if (dbPool) return dbPool;
+
+  dbPool = mysql.createPool({
+    host: DB_HOST,
+    port: DB_PORT,
+    user: DB_USERNAME,
+    password: DB_PASSWORD,
+    database: DB_DATABASE,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    charset: 'utf8mb4'
+  });
+
+  if (CHAT_AUTO_CREATE_TABLE) {
+    await ensureMessagesTable();
+  }
+
+  return dbPool;
+}
+
+async function ensureMessagesTable() {
+  const pool = await getDbPool();
+  if (!pool) return;
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ${CHAT_MESSAGES_TABLE} (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      tenant_id VARCHAR(64) NULL,
+      message_id VARCHAR(64) NOT NULL,
+      channel_name VARCHAR(100) NOT NULL,
+      user_id VARCHAR(64) NOT NULL,
+      user_name VARCHAR(120) NOT NULL,
+      message_text TEXT NOT NULL,
+      meta_json JSON NULL,
+      created_at BIGINT UNSIGNED NOT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_message_id (message_id),
+      KEY idx_channel_created (channel_name, created_at),
+      KEY idx_tenant_channel_created (tenant_id, channel_name, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+}
 
 function getAblyClient() {
   if (!ABLY_API_KEY) return null;
@@ -49,15 +108,11 @@ function clampLimit(input, fallback = 30) {
   return Math.min(Math.max(Math.floor(n), 1), 100);
 }
 
-function pushMemoryMessage(channel, message) {
-  const current = memoryHistory.get(channel) || [];
-  current.push(message);
-  const trimmed = current.slice(-100);
-  memoryHistory.set(channel, trimmed);
-}
-
-function getMemoryHistory(channel, limit) {
-  return (memoryHistory.get(channel) || []).slice(-limit);
+function getTenantId(req) {
+  const tenant = req.headers['x-tenant-id'];
+  if (typeof tenant !== 'string') return null;
+  const clean = tenant.trim();
+  return clean || null;
 }
 
 async function publishMessage(channelName, payload) {
@@ -88,11 +143,76 @@ async function createTokenRequest({ clientId, channels }) {
   });
 }
 
-async function fetchHistory(channelName, limit) {
-  const client = getAblyClient();
-  if (!client) {
-    return getMemoryHistory(channelName, limit);
+async function saveMessageToDb(message) {
+  const pool = await getDbPool();
+  if (!pool) return false;
+
+  await pool.query(
+    `INSERT INTO ${CHAT_MESSAGES_TABLE}
+      (tenant_id, message_id, channel_name, user_id, user_name, message_text, meta_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+      user_name = VALUES(user_name),
+      message_text = VALUES(message_text),
+      meta_json = VALUES(meta_json),
+      created_at = VALUES(created_at)`,
+    [
+      message.tenantId,
+      message.messageId,
+      message.channel,
+      message.userId,
+      message.userName,
+      message.text,
+      message.meta ? JSON.stringify(message.meta) : null,
+      message.ts
+    ]
+  );
+
+  return true;
+}
+
+async function fetchHistoryFromDb({ tenantId, channelName, limit }) {
+  const pool = await getDbPool();
+  if (!pool) return null;
+
+  let rows;
+  if (tenantId) {
+    [rows] = await pool.query(
+      `SELECT tenant_id, message_id, channel_name, user_id, user_name, message_text, meta_json, created_at
+       FROM ${CHAT_MESSAGES_TABLE}
+       WHERE tenant_id = ? AND channel_name = ?
+       ORDER BY created_at DESC
+       LIMIT ?`,
+      [tenantId, channelName, limit]
+    );
+  } else {
+    [rows] = await pool.query(
+      `SELECT tenant_id, message_id, channel_name, user_id, user_name, message_text, meta_json, created_at
+       FROM ${CHAT_MESSAGES_TABLE}
+       WHERE channel_name = ?
+       ORDER BY created_at DESC
+       LIMIT ?`,
+      [channelName, limit]
+    );
   }
+
+  return rows
+    .reverse()
+    .map((row) => ({
+      tenantId: row.tenant_id,
+      messageId: row.message_id,
+      channel: row.channel_name,
+      userId: row.user_id,
+      userName: row.user_name,
+      text: row.message_text,
+      meta: row.meta_json || null,
+      ts: Number(row.created_at)
+    }));
+}
+
+async function fetchHistoryFromAbly(channelName, limit) {
+  const client = getAblyClient();
+  if (!client) return [];
 
   const channel = client.channels.get(channelName);
 
@@ -103,12 +223,10 @@ async function fetchHistory(channelName, limit) {
     });
   });
 
-  const items = (page.items || [])
+  return (page.items || [])
     .map((item) => item.data)
     .filter(Boolean)
     .reverse();
-
-  return items;
 }
 
 function renderHomePage() {
@@ -117,67 +235,23 @@ function renderHomePage() {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Hostinger Node App</title>
+  <title>Chat Engine API</title>
   <style>
-    :root {
-      --bg-1: #0f172a;
-      --bg-2: #1e293b;
-      --card: rgba(15, 23, 42, 0.78);
-      --text: #e2e8f0;
-      --accent: #22d3ee;
-      --accent-2: #34d399;
-    }
+    :root { --bg-1: #0f172a; --bg-2: #1e293b; --text: #e2e8f0; --accent: #22d3ee; --accent-2: #34d399; }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(circle at 15% 20%, #0ea5e9 0%, transparent 40%),
-        radial-gradient(circle at 85% 80%, #10b981 0%, transparent 35%),
-        linear-gradient(135deg, var(--bg-1), var(--bg-2));
-    }
-    .card {
-      width: min(760px, 92vw);
-      padding: 32px 28px;
-      border: 1px solid rgba(148, 163, 184, 0.3);
-      border-radius: 18px;
-      background: var(--card);
-      backdrop-filter: blur(4px);
-      box-shadow: 0 18px 50px rgba(2, 6, 23, 0.45);
-      text-align: center;
-    }
-    h1 {
-      margin: 0 0 12px;
-      font-size: clamp(1.6rem, 4vw, 2.3rem);
-      line-height: 1.2;
-    }
-    p {
-      margin: 0;
-      color: #cbd5e1;
-      font-size: clamp(1rem, 2.2vw, 1.15rem);
-    }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: "Segoe UI", sans-serif; color: var(--text); background:
+      radial-gradient(circle at 15% 20%, #0ea5e9 0%, transparent 40%),
+      radial-gradient(circle at 85% 80%, #10b981 0%, transparent 35%),
+      linear-gradient(135deg, var(--bg-1), var(--bg-2)); }
+    .card { width: min(760px, 92vw); padding: 32px 28px; border: 1px solid rgba(148, 163, 184, 0.3); border-radius: 18px; background: rgba(15, 23, 42, 0.78); text-align: center; }
     .row { margin-top: 18px; display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
-    .chip {
-      display: inline-block;
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-size: 0.85rem;
-      letter-spacing: 0.02em;
-      color: #06202a;
-      background: linear-gradient(90deg, var(--accent), var(--accent-2));
-      font-weight: 700;
-      text-decoration: none;
-    }
+    .chip { display: inline-block; padding: 8px 12px; border-radius: 999px; font-size: 0.85rem; color: #06202a; background: linear-gradient(90deg, var(--accent), var(--accent-2)); font-weight: 700; text-decoration: none; }
   </style>
 </head>
 <body>
   <main class="card">
-    <h1>Chat Engine API Ready</h1>
-    <p>Laravel can call this Node service for realtime chat with Ably.</p>
+    <h1>Node Chat Engine + Laravel Tenant DB</h1>
+    <p>API is ready for Laravel integration.</p>
     <div class="row">
       <a class="chip" href="/chat">Open Demo Chat UI</a>
       <a class="chip" href="/health">Service Health</a>
@@ -194,168 +268,13 @@ function renderChatPage() {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Ably Chat Demo</title>
-  <style>
-    :root {
-      --bg: #0b1020;
-      --panel: #111a34;
-      --panel-2: #0f1730;
-      --text: #e8eefc;
-      --muted: #91a0c0;
-      --line: #22315f;
-      --accent: #00d4ff;
-      --accent-2: #00ffa3;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(800px 500px at 15% -10%, rgba(0, 212, 255, 0.2), transparent 60%),
-        radial-gradient(800px 500px at 95% 110%, rgba(0, 255, 163, 0.2), transparent 60%),
-        var(--bg);
-      display: grid;
-      place-items: center;
-      padding: 20px;
-    }
-    .chat-wrap {
-      width: min(860px, 96vw);
-      background: linear-gradient(180deg, var(--panel), var(--panel-2));
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
-      overflow: hidden;
-    }
-    .topbar {
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-    }
-    .title { font-size: 1rem; font-weight: 700; }
-    .status { font-size: 0.85rem; color: var(--muted); }
-    #messages {
-      height: 52vh;
-      min-height: 320px;
-      overflow: auto;
-      padding: 16px;
-      display: grid;
-      gap: 10px;
-    }
-    .msg {
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      border-radius: 12px;
-      padding: 10px 12px;
-    }
-    .meta { font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
-    .text { font-size: 0.95rem; line-height: 1.35; white-space: pre-wrap; }
-    .composer {
-      border-top: 1px solid var(--line);
-      padding: 12px;
-      display: grid;
-      gap: 10px;
-    }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    input, button {
-      border-radius: 10px;
-      border: 1px solid var(--line);
-      background: #0c1430;
-      color: var(--text);
-      padding: 10px 12px;
-      font-size: 0.95rem;
-    }
-    button {
-      cursor: pointer;
-      background: linear-gradient(90deg, var(--accent), var(--accent-2));
-      color: #02222a;
-      font-weight: 700;
-      border: none;
-    }
-  </style>
 </head>
 <body>
-  <main class="chat-wrap">
-    <div class="topbar">
-      <div class="title">Ably Realtime Chat Demo</div>
-      <div id="status" class="status">Connecting...</div>
-    </div>
-    <section id="messages"></section>
-    <form id="chatForm" class="composer">
-      <div class="row">
-        <input id="nameInput" maxlength="24" placeholder="Your name" required />
-        <input value="global-chat" id="channelInput" maxlength="64" placeholder="Channel" required />
-      </div>
-      <input id="messageInput" maxlength="500" placeholder="Type a message" required />
-      <button type="submit">Send Message</button>
-    </form>
-  </main>
-
+  <h2>Ably Chat Demo</h2>
+  <p>Use Laravel-issued tokens for production; this is only for demo.</p>
   <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
   <script>
-    const messagesEl = document.getElementById('messages');
-    const statusEl = document.getElementById('status');
-    const formEl = document.getElementById('chatForm');
-    const nameInput = document.getElementById('nameInput');
-    const channelInput = document.getElementById('channelInput');
-    const messageInput = document.getElementById('messageInput');
-
-    let channel;
-
-    function addMessage(user, text, ts) {
-      const item = document.createElement('article');
-      item.className = 'msg';
-      const when = new Date(ts || Date.now()).toLocaleTimeString();
-      item.innerHTML = '<div class="meta">' + user + ' • ' + when + '</div><div class="text"></div>';
-      item.querySelector('.text').textContent = text;
-      messagesEl.appendChild(item);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-    }
-
-    async function connect() {
-      const clientId = 'demo-' + Math.random().toString(36).slice(2, 8);
-      const realtime = new Ably.Realtime({ authUrl: '/api/ably-token?clientId=' + encodeURIComponent(clientId) });
-
-      realtime.connection.on('connected', () => {
-        statusEl.textContent = 'Connected';
-      });
-
-      realtime.connection.on('failed', (stateChange) => {
-        statusEl.textContent = 'Connection failed: ' + stateChange.reason.message;
-      });
-
-      const channelName = channelInput.value.trim() || 'global-chat';
-      channel = realtime.channels.get(channelName);
-
-      channel.subscribe('message', (msg) => {
-        const data = msg.data || {};
-        addMessage(data.userName || data.user || 'Anonymous', data.text || '', data.ts || msg.timestamp);
-      });
-    }
-
-    formEl.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      if (!channel) return;
-
-      const userName = nameInput.value.trim() || 'Anonymous';
-      const text = messageInput.value.trim();
-      if (!text) return;
-
-      await channel.publish('message', {
-        userName,
-        text,
-        ts: Date.now(),
-        messageId: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now())
-      });
-
-      messageInput.value = '';
-      messageInput.focus();
-    });
-
-    connect();
+    console.log('Demo UI available at /chat');
   </script>
 </body>
 </html>`;
@@ -381,45 +300,24 @@ app.get('/api/ably-token', async (req, res) => {
   try {
     const requestedId = String(req.query.clientId || '').trim();
     const clientId = requestedId || `demo-${Date.now()}`;
-    const tokenRequest = await createTokenRequest({
-      clientId,
-      channels: [DEFAULT_CHANNEL]
-    });
-
+    const tokenRequest = await createTokenRequest({ clientId, channels: [DEFAULT_CHANNEL] });
     return res.json(tokenRequest);
-  } catch (error) {
+  } catch {
     return res.status(500).json({ error: 'Failed to create demo token request.' });
-  }
-});
-
-app.post('/api/chat/token', requireEngineKey, async (req, res) => {
-  const { userId, userName, channels } = req.body || {};
-
-  if (!userId || !userName) {
-    return res.status(400).json({ error: 'userId and userName are required.' });
-  }
-
-  try {
-    const tokenRequest = await createTokenRequest({
-      clientId: `${userId}:${String(userName).trim()}`,
-      channels
-    });
-
-    return res.json({ tokenRequest });
-  } catch (error) {
-    return res.status(500).json({ error: error.message || 'Failed to create token request.' });
   }
 });
 
 app.post('/api/chat/messages', requireEngineKey, async (req, res) => {
   const { channel, userId, userName, text, meta } = req.body || {};
   const channelName = String(channel || DEFAULT_CHANNEL).trim();
+  const tenantId = getTenantId(req);
 
   if (!userId || !userName || !text) {
     return res.status(400).json({ error: 'userId, userName, and text are required.' });
   }
 
   const message = {
+    tenantId,
     messageId: crypto.randomUUID(),
     channel: channelName,
     userId: String(userId),
@@ -435,7 +333,7 @@ app.post('/api/chat/messages', requireEngineKey, async (req, res) => {
 
   try {
     await publishMessage(channelName, message);
-    pushMemoryMessage(channelName, message);
+    await saveMessageToDb(message);
     return res.status(201).json({ ok: true, message });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to publish message.' });
@@ -445,21 +343,37 @@ app.post('/api/chat/messages', requireEngineKey, async (req, res) => {
 app.get('/api/chat/history', requireEngineKey, async (req, res) => {
   const channelName = String(req.query.channel || DEFAULT_CHANNEL).trim();
   const limit = clampLimit(req.query.limit, 30);
+  const tenantId = getTenantId(req);
 
   try {
-    const messages = await fetchHistory(channelName, limit);
-    return res.json({ channel: channelName, messages, count: messages.length });
-  } catch (error) {
+    const dbMessages = await fetchHistoryFromDb({ tenantId, channelName, limit });
+    const messages = dbMessages || (await fetchHistoryFromAbly(channelName, limit));
+    return res.json({ channel: channelName, tenantId, messages, count: messages.length });
+  } catch {
     return res.status(500).json({ error: 'Failed to fetch chat history.' });
   }
 });
 
-app.get('/api/chat/health', requireEngineKey, (req, res) => {
+app.get('/api/chat/health', requireEngineKey, async (req, res) => {
+  let dbReady = false;
+  try {
+    const pool = await getDbPool();
+    dbReady = Boolean(pool);
+  } catch {
+    dbReady = false;
+  }
+
   res.json({
     status: 'ok',
     engine: 'node-ably',
     defaultChannel: DEFAULT_CHANNEL,
-    hasAblyKey: Boolean(ABLY_API_KEY)
+    hasAblyKey: Boolean(ABLY_API_KEY),
+    db: {
+      enabled: hasDbConfig(),
+      ready: dbReady,
+      database: DB_DATABASE || null,
+      table: CHAT_MESSAGES_TABLE
+    }
   });
 });
 
