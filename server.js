@@ -17,6 +17,62 @@ const DEMO_CHANNEL = process.env.CHAT_DEFAULT_CHANNEL || 'global-chat';
 
 app.use(express.json());
 
+const diagnostics = {
+  startedAt: Date.now(),
+  requestCount: 0,
+  totalInBytes: 0,
+  totalOutBytes: 0,
+  totalLatencyMs: 0,
+  statusBuckets: {},
+  latencySamples: [],
+  recent: []
+};
+
+function bytesFromContentLength(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function percentile(samples, pct) {
+  if (!samples.length) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((pct / 100) * sorted.length) - 1));
+  return sorted[idx];
+}
+
+app.use((req, res, next) => {
+  const started = process.hrtime.bigint();
+  const reqBytes = bytesFromContentLength(req.headers['content-length']);
+
+  res.on('finish', () => {
+    const latencyMs = Number(process.hrtime.bigint() - started) / 1000000;
+    const outBytes = bytesFromContentLength(res.getHeader('content-length'));
+    const status = String(res.statusCode);
+
+    diagnostics.requestCount += 1;
+    diagnostics.totalInBytes += reqBytes;
+    diagnostics.totalOutBytes += outBytes;
+    diagnostics.totalLatencyMs += latencyMs;
+    diagnostics.statusBuckets[status] = (diagnostics.statusBuckets[status] || 0) + 1;
+    diagnostics.latencySamples.push(latencyMs);
+    if (diagnostics.latencySamples.length > 2000) diagnostics.latencySamples.shift();
+
+    diagnostics.recent.push({
+      at: new Date().toISOString(),
+      method: req.method,
+      path: req.originalUrl || req.url,
+      status: res.statusCode,
+      latency_ms: Number(latencyMs.toFixed(2)),
+      in_bytes: reqBytes,
+      out_bytes: outBytes,
+      ip: req.ip
+    });
+    if (diagnostics.recent.length > 120) diagnostics.recent.shift();
+  });
+
+  next();
+});
+
 const dbPoolCache = new Map();
 const tableExistsCache = new Map();
 const ablyClientCache = new Map();
@@ -335,6 +391,7 @@ function renderHomePage() {
   <ul>
     <li><a href="/health">/health</a></li>
     <li><a href="/chat">/chat demo</a></li>
+    <li><a href="/diag">/diag diagnostics</a></li>
   </ul>
 </body>
 </html>`;
@@ -360,6 +417,114 @@ app.get('/', (req, res) => {
 
 app.get('/chat', (req, res) => {
   res.send(renderChatPage());
+});
+
+app.get('/api/diag/summary', (req, res) => {
+  const uptimeSec = Math.floor((Date.now() - diagnostics.startedAt) / 1000);
+  const avgLatency = diagnostics.requestCount
+    ? diagnostics.totalLatencyMs / diagnostics.requestCount
+    : 0;
+
+  return res.json({
+    status: 'ok',
+    uptime_sec: uptimeSec,
+    started_at: new Date(diagnostics.startedAt).toISOString(),
+    request_count: diagnostics.requestCount,
+    transfer: {
+      in_bytes: diagnostics.totalInBytes,
+      out_bytes: diagnostics.totalOutBytes
+    },
+    latency: {
+      avg_ms: Number(avgLatency.toFixed(2)),
+      p50_ms: Number(percentile(diagnostics.latencySamples, 50).toFixed(2)),
+      p95_ms: Number(percentile(diagnostics.latencySamples, 95).toFixed(2))
+    },
+    statuses: diagnostics.statusBuckets,
+    memory: process.memoryUsage(),
+    recent: diagnostics.recent.slice(-30)
+  });
+});
+
+app.get('/api/diag/ping', (req, res) => {
+  res.json({ status: 'ok', now: Date.now() });
+});
+
+app.get('/diag', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chat Engine Diagnostics</title>
+  <style>
+    :root { --bg:#0b1220; --panel:#111a2d; --card:#16223b; --text:#e8eefc; --muted:#99a8c7; --ok:#39d98a; }
+    body { margin:0; font-family:Segoe UI,system-ui,-apple-system,sans-serif; background:linear-gradient(120deg,#0b1220,#121f35); color:var(--text); }
+    .wrap { max-width:1100px; margin:24px auto; padding:0 16px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .card { background:var(--card); border-radius:10px; padding:14px; }
+    .k { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .v { font-size:24px; margin-top:6px; font-weight:700; }
+    .table { width:100%; border-collapse:collapse; margin-top:14px; }
+    th,td { border-bottom:1px solid #233252; padding:8px 6px; font-size:13px; text-align:left; }
+    .pill { display:inline-block; background:#223154; color:#bcd0f7; padding:2px 8px; border-radius:999px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Node Chat Diagnostics</h1>
+    <p class="k">Live troubleshooting for ping, transfer volume, status codes, and recent API traffic.</p>
+    <div class="grid">
+      <div class="card"><div class="k">Ping</div><div class="v" id="ping">-</div></div>
+      <div class="card"><div class="k">Requests</div><div class="v" id="requests">-</div></div>
+      <div class="card"><div class="k">Avg Latency</div><div class="v" id="latency">-</div></div>
+      <div class="card"><div class="k">In / Out</div><div class="v" id="transfer">-</div></div>
+    </div>
+    <h3>Recent Traffic</h3>
+    <table class="table">
+      <thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th><th>In</th><th>Out</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="7">Loading...</td></tr></tbody>
+    </table>
+  </div>
+  <script>
+    const fmtBytes = (n) => {
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / (1024 * 1024)).toFixed(2) + ' MB';
+    };
+
+    async function poll() {
+      const t0 = performance.now();
+      const pingRes = await fetch('/api/diag/ping', { cache: 'no-store' });
+      await pingRes.json();
+      const pingMs = Math.round(performance.now() - t0);
+
+      const res = await fetch('/api/diag/summary', { cache: 'no-store' });
+      const data = await res.json();
+
+      document.getElementById('ping').textContent = pingMs + ' ms';
+      document.getElementById('requests').textContent = String(data.request_count || 0);
+      document.getElementById('latency').textContent = (data.latency?.avg_ms ?? 0) + ' ms';
+      document.getElementById('transfer').textContent = fmtBytes(data.transfer?.in_bytes || 0) + ' / ' + fmtBytes(data.transfer?.out_bytes || 0);
+
+      const rows = (data.recent || []).slice().reverse().map((r) => (
+        '<tr>' +
+        '<td>' + (r.at || '-') + '</td>' +
+        '<td><span class="pill">' + (r.method || '-') + '</span></td>' +
+        '<td>' + (r.path || '-') + '</td>' +
+        '<td>' + (r.status || '-') + '</td>' +
+        '<td>' + (r.latency_ms || 0) + ' ms</td>' +
+        '<td>' + fmtBytes(r.in_bytes || 0) + '</td>' +
+        '<td>' + fmtBytes(r.out_bytes || 0) + '</td>' +
+        '</tr>'
+      )).join('');
+      document.getElementById('rows').innerHTML = rows || '<tr><td colspan="7">No traffic yet</td></tr>';
+    }
+
+    poll().catch(() => {});
+    setInterval(() => poll().catch(() => {}), 3000);
+  </script>
+</body>
+</html>`);
 });
 
 app.get('/api/ably-token', async (req, res) => {
